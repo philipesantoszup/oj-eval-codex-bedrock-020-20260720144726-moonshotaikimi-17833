@@ -16,24 +16,22 @@ static void *base_addr = NULL;
 static int total_pages = 0;
 static block_t *free_lists[MAX_RANK + 2];
 static uint8_t *page_alloc_rank = NULL;
+static int free_count[MAX_RANK + 2];  // Track count of free blocks per rank
 
 static inline int rank_to_pages(int rank) {
     return 1 << (rank - 1);
 }
 
-// Get buddy using offset from base (0-indexed page number)
-// For a block starting at page idx with given rank, return its buddy's page idx
+// Get buddy page index using XOR
 static inline int get_buddy_page(int page_idx, int rank) {
     int size = rank_to_pages(rank);
     return page_idx ^ size;
 }
 
-// Convert page index to address
 static inline void* page_to_addr(int page_idx) {
     return (char*)base_addr + page_idx * PAGE_SIZE;
 }
 
-// Convert address to page index
 static inline int addr_to_page(void *p) {
     return (int)(((uintptr_t)p - (uintptr_t)base_addr) / PAGE_SIZE);
 }
@@ -55,6 +53,7 @@ static void remove_from_free_list(block_t *block, int rank) {
     if (block->next != NULL) {
         block->next->prev = block->prev;
     }
+    free_count[rank]--;
 }
 
 static void add_to_free_list(block_t *block, int rank) {
@@ -64,14 +63,19 @@ static void add_to_free_list(block_t *block, int rank) {
         free_lists[rank]->prev = block;
     }
     free_lists[rank] = block;
+    free_count[rank]++;
 }
 
 static int coalesce_block(int page_idx, int rank) {
     while (rank < MAX_RANK) {
         int buddy_idx = get_buddy_page(page_idx, rank);
-        void *buddy_addr = page_to_addr(buddy_idx);
         
-        // Check if buddy is in free list of same rank
+        // Fast check: is buddy_idx valid and free?
+        if (buddy_idx < 0 || buddy_idx >= total_pages) {
+            break;
+        }
+        
+        // Look for buddy in free list - need to search since we don't have a hash table
         block_t *b = free_lists[rank];
         int found_buddy = 0;
         while (b != NULL) {
@@ -87,7 +91,7 @@ static int coalesce_block(int page_idx, int rank) {
         }
         
         // Remove buddy from free list
-        remove_from_free_list((block_t*)buddy_addr, rank);
+        remove_from_free_list((block_t*)page_to_addr(buddy_idx), rank);
         
         // Remove current from free list
         remove_from_free_list((block_t*)page_to_addr(page_idx), rank);
@@ -110,19 +114,24 @@ int init_page(void *p, int pgcount) {
     base_addr = p;
     total_pages = pgcount;
     
-    for (int i = 0; i <= MAX_RANK + 1; i++) {
-        free_lists[i] = NULL;
-    }
+    memset(free_lists, 0, sizeof(free_lists));
+    memset(free_count, 0, sizeof(free_count));
     
     static uint8_t rank_array[65536];
     page_alloc_rank = rank_array;
     memset(page_alloc_rank, 0, total_pages * sizeof(uint8_t));
     
-    // Add all pages as rank 1 blocks in reverse order
+    // Add all pages as rank 1 blocks
     for (int i = pgcount - 1; i >= 0; i--) {
         block_t *block = (block_t*)page_to_addr(i);
-        add_to_free_list(block, 1);
+        block->next = free_lists[1];
+        block->prev = NULL;
+        if (free_lists[1] != NULL) {
+            free_lists[1]->prev = block;
+        }
+        free_lists[1] = block;
     }
+    free_count[1] = pgcount;
     
     return OK;
 }
@@ -151,9 +160,16 @@ void *alloc_pages(int rank) {
         int page_idx = addr_to_page(block);
         int buddy_idx = page_idx + rank_to_pages(current_rank);
         
-        // Add buddies to free list - lower index first so it's used
+        // Add buddies - lower index first to maintain order
         add_to_free_list((block_t*)page_to_addr(buddy_idx), current_rank);
-        add_to_free_list((block_t*)page_to_addr(page_idx), current_rank);
+        block_t *b1 = (block_t*)page_to_addr(page_idx);
+        b1->next = free_lists[current_rank];
+        b1->prev = NULL;
+        if (free_lists[current_rank] != NULL) {
+            free_lists[current_rank]->prev = b1;
+        }
+        free_lists[current_rank] = b1;
+        free_count[current_rank]++;
     }
     
     // Take from free list
@@ -225,12 +241,5 @@ int query_page_counts(int rank) {
         return -EINVAL;
     }
     
-    int count = 0;
-    block_t *block = free_lists[rank];
-    while (block != NULL) {
-        count++;
-        block = block->next;
-    }
-    
-    return count;
+    return free_count[rank];
 }
